@@ -15,6 +15,7 @@ import os
 import psutil
 import requests
 import statistics
+import subprocess
 import time
 import threading
 import io
@@ -58,6 +59,7 @@ class OllamaBenchmark:
         self.resource_usage = {
             "cpu": [],
             "memory": [],
+            "temperature": [],
             "start_time": 0,
             "end_time": 0
         }
@@ -132,6 +134,45 @@ class OllamaBenchmark:
             }
         ]
     
+    def _get_temperature(self) -> float:
+        """
+        Get CPU temperature using vcgencmd for Raspberry Pi or psutil as fallback.
+        
+        Returns:
+            Float temperature in Celsius or 0 if unable to get temperature
+        """
+        # Try vcgencmd first (Raspberry Pi specific)
+        try:
+            result = subprocess.run(['vcgencmd', 'measure_temp'], 
+                                    capture_output=True, text=True, check=True)
+            # Output format is "temp=XX.X'C"
+            temp_str = result.stdout.strip()
+            if temp_str.startswith('temp=') and temp_str.endswith("'C"):
+                # Extract the temperature value (remove 'temp=' and "'C")
+                temp_value = float(temp_str[5:-2])
+                return temp_value
+        except (subprocess.SubprocessError, FileNotFoundError, ValueError):
+            # vcgencmd not available or error occurred, fallback to psutil
+            pass
+            
+        # Fallback to psutil
+        try:
+            if hasattr(psutil, "sensors_temperatures"):
+                temps = psutil.sensors_temperatures()
+                if temps:
+                    # Raspberry Pi and many Linux systems report CPU temp under "cpu_thermal" or "coretemp"
+                    for chip, sensors in temps.items():
+                        if chip in ["cpu_thermal", "coretemp"]:
+                            return sensors[0].current
+                    
+                    # If specific sensors not found, use first available temp sensor
+                    if list(temps.values()) and list(temps.values())[0]:
+                        return list(temps.values())[0][0].current
+        except Exception:
+            pass
+            
+        return 0.0
+    
     def _start_resource_monitoring(self):
         """Start monitoring system resources."""
         self.resource_usage["start_time"] = time.time()
@@ -141,6 +182,11 @@ class OllamaBenchmark:
             while not self.stop_monitoring:
                 self.resource_usage["cpu"].append(psutil.cpu_percent(interval=0.5))
                 self.resource_usage["memory"].append(psutil.virtual_memory().percent)
+                
+                # Get CPU temperature using vcgencmd or fallback
+                temp = self._get_temperature()
+                self.resource_usage["temperature"].append(temp)
+                
                 time.sleep(0.5)
         
         self.monitor_thread = threading.Thread(target=monitor_resources)
@@ -290,7 +336,7 @@ class OllamaBenchmark:
     
     def measure_resource_usage(self) -> Dict[str, Any]:
         """
-        Measure CPU and memory usage during benchmark.
+        Measure CPU, memory and temperature usage during benchmark.
         
         Returns:
             Dictionary with resource usage statistics
@@ -300,7 +346,7 @@ class OllamaBenchmark:
                 "error": "No resource usage data collected"
             }
         
-        return {
+        result = {
             "cpu": {
                 "min": min(self.resource_usage["cpu"]),
                 "max": max(self.resource_usage["cpu"]),
@@ -316,6 +362,21 @@ class OllamaBenchmark:
             "duration": self.resource_usage["end_time"] - self.resource_usage["start_time"],
             "samples": len(self.resource_usage["cpu"])
         }
+        
+        # Add temperature stats if we collected any non-zero values
+        temp_values = [t for t in self.resource_usage["temperature"] if t > 0]
+        if temp_values:
+            result["temperature"] = {
+                "min": min(temp_values),
+                "max": max(temp_values),
+                "mean": statistics.mean(temp_values),
+                "median": statistics.median(temp_values),
+                "unit": "°C"
+            }
+        else:
+            result["temperature"] = {"available": False}
+            
+        return result
     
     def measure_accuracy(self) -> Dict[str, Any]:
         """
@@ -394,7 +455,8 @@ class OllamaBenchmark:
                     "prompt_size": self.prompt_size,
                     "num_requests": self.num_requests,
                     "num_threads": self.num_threads,
-                    "platform": "Raspberry Pi 5"
+                    "platform": "Raspberry Pi 5",
+                    "temp_monitor": "vcgencmd"
                 },
                 "latency": latency_results,
                 "throughput": throughput_results,
@@ -441,6 +503,10 @@ class OllamaBenchmark:
         self._print("\nResource Usage:")
         self._print(f"  CPU: {ru['cpu']['mean']:.1f}% (peak: {ru['cpu']['max']:.1f}%)")
         self._print(f"  Memory: {ru['memory']['mean']:.1f}% (peak: {ru['memory']['max']:.1f}%)")
+        
+        # Add temperature information if available
+        if "temperature" in ru and "mean" in ru["temperature"]:
+            self._print(f"  Temperature: {ru['temperature']['mean']:.1f}°C (peak: {ru['temperature']['max']:.1f}°C) [vcgencmd]")
         
         # Accuracy summary if available
         if not self.results["accuracy"].get("skipped", False):
